@@ -9,8 +9,11 @@ from fanficfare.fetchers.fetcher_requests import RequestsFetcher
 
 
 class RequestsFetcherRetryTest(unittest.TestCase):
+    # retry_http_525_failures:true as in defaults.ini.
+    DEFAULT_CONFIG = {'retry_http_525_failures': 'true'}
+
     def make_fetcher(self, config=None):
-        config = config or {}
+        config = dict(self.DEFAULT_CONFIG, **(config or {}))
         fetcher = RequestsFetcher(lambda key, default=None: config.get(key, default),
                                  lambda key: [])
         # Ignore environment proxies and netrc credentials for local tests.
@@ -76,6 +79,16 @@ class RequestsFetcherRetryTest(unittest.TestCase):
                 self.assertEqual(len(seen), attempts)
                 self.assertEqual([call.args[0] for call in sleep.call_args_list], delays)
 
+    def test_525_not_retried_when_disabled(self):
+        url, seen = self.serve([525, 200])
+        fetcher = self.make_fetcher({'retry_http_525_failures': False})
+        with patch('urllib3.util.retry.time.sleep') as sleep:
+            with self.assertRaises(HTTPErrorFFF) as error:
+                fetcher.request('GET', url)
+        self.assertEqual(error.exception.status_code, 525)
+        self.assertEqual(len(seen), 1)
+        sleep.assert_not_called()
+
     def test_other_cloudflare_errors_are_not_retried(self):
         fetcher = self.make_fetcher()
         for status in (520, 521, 522, 523, 524, 526):
@@ -102,6 +115,10 @@ class RequestsFetcherRetryTest(unittest.TestCase):
         self.assertEqual(fetcher.retries.other, 0)
         self.assertFalse(fetcher.retries.raise_on_status)
         self.assertTrue(fetcher.use_verify())
+
+        fetcher = self.make_fetcher({'retry_http_525_failures': False})
+        self.assertEqual(fetcher.retries.status_forcelist,
+                         {413, 429, 500, 502, 503, 504})
 
 
 if __name__ == '__main__':
