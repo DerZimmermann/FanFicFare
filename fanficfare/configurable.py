@@ -699,8 +699,11 @@ class Configuration(ConfigParser):
         return self.get_config(self.sectionslist,key,default)
 
     def get_config(self, sections, key, default=""):
+        ## default is part of the cache key: an unset key is asked
+        ## for with different defaults by different callers.
+        cachekey = (tuple(sections),key,default)
         try:
-            return self.cached_config[(tuple(sections),key)]
+            return self.cached_config[cachekey]
         except KeyError as ke:
             pass
         val = default
@@ -747,7 +750,7 @@ class Configuration(ConfigParser):
             except (configparser.NoOptionError, configparser.NoSectionError) as e:
                 pass
 
-        self.cached_config[(tuple(sections),key)] = val
+        self.cached_config[cachekey] = val
         return val
 
     # split and strip each.
