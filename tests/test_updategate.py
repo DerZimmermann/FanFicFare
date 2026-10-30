@@ -10,7 +10,7 @@ downloaded.
 """
 import pytest
 
-from fanficfare.updategate import decide_update
+from fanficfare.updategate import decide_update, count_chapter_changes
 
 
 @pytest.mark.parametrize('chaptercount,urlchaptercount,kwargs,expected', [
@@ -43,3 +43,23 @@ from fanficfare.updategate import decide_update
 ])
 def test_decide_update(chaptercount, urlchaptercount, kwargs, expected):
     assert decide_update(chaptercount, urlchaptercount, **kwargs) == expected
+
+
+@pytest.mark.parametrize('chaptercount,old_urls,site_urls,expected', [
+    # Nothing changed.
+    (3, ['a', 'b', 'c'], ['a', 'b', 'c'], (0, 0)),
+    # Two new chapters at the end.
+    (3, ['a', 'b', 'c'], ['a', 'b', 'c', 'd', 'e'], (2, 0)),
+    # Same count, but one chapter swapped out -- counts alone miss this.
+    (3, ['a', 'b', 'c'], ['a', 'c', 'd'], (1, 1)),
+    # Site removed chapters, nothing new.
+    (3, ['a', 'b', 'c'], ['a'], (0, 2)),
+    # Fewer chapters on site, but still one new (preserved deleted
+    # chapters in the existing file).
+    (4, ['a', 'b', 'c', 'd'], ['a', 'b', 'e'], (1, 2)),
+    # Old epub without chapter URLs: compare counts only.
+    (3, [], ['a', 'b', 'c', 'd'], (1, 0)),
+    (3, [], ['a', 'b'], (0, 1)),
+])
+def test_count_chapter_changes(chaptercount, old_urls, site_urls, expected):
+    assert count_chapter_changes(chaptercount, old_urls, site_urls) == expected

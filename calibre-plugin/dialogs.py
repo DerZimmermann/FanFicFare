@@ -219,6 +219,14 @@ class INISnippetDialog:
     def get_ini_snippet_name(self):
         return self.ini_snip.currentText()
 
+    def restore_ini_snippet(self,snip_name,snip_text):
+        '''Select saved snippet snip_name, or use snip_text as a
+        one-time snippet if it isn't saved (anymore).'''
+        self.populate_snip_combobox(snip_name)
+        if snip_text and not self.ini_snippet_text:
+            self.ini_snip.setCurrentIndex(1)
+            self.ini_snippet_text = snip_text
+
     def populate_snip_combobox(self,snip_name=None):
         self.ini_snippet_text = None
         self.ini_snip.clear()
@@ -602,6 +610,7 @@ class AddNewDialog(HotKeyedSizePersistedDialog, INISnippetDialog):
                 'smarten_punctuation':self.prefs['smarten_punctuation'],
                 'do_wordcount':self.prefs['do_wordcount'],
                 'ini_snippet':self.get_ini_snippet_text(),
+                'ini_snippet_name':self.get_ini_snippet_name(),
                 } )
 
         if self.merge:
@@ -1113,7 +1122,7 @@ class UpdateExistingDialog(SizePersistedDialog, INISnippetDialog):
         self.fileform.addItem('mobi')
         self.fileform.addItem('html')
         self.fileform.addItem('txt')
-        self.fileform.setCurrentIndex(self.fileform.findText(self.prefs['fileform']))
+        self.fileform.setCurrentIndex(self.fileform.findText(extraoptions.get('fileform',self.prefs['fileform'])))
         self.fileform.setToolTip(_('Choose output format to create.  May set default from plugin configuration.'))
         self.fileform.activated.connect(self.set_collisions)
         label.setBuddy(self.fileform)
@@ -1152,6 +1161,9 @@ class UpdateExistingDialog(SizePersistedDialog, INISnippetDialog):
         horz.addWidget(self.bgmeta)
 
         self.make_ini_snippet_widgets()
+        if extraoptions.get('ini_snippet'):
+            self.restore_ini_snippet(extraoptions.get('ini_snippet_name'),
+                                     extraoptions['ini_snippet'])
         horz.addWidget(self.ini_snip)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1203,6 +1215,7 @@ class UpdateExistingDialog(SizePersistedDialog, INISnippetDialog):
             'smarten_punctuation':self.prefs['smarten_punctuation'],
             'do_wordcount':self.prefs['do_wordcount'],
             'ini_snippet':self.get_ini_snippet_text(),
+            'ini_snippet_name':self.get_ini_snippet_name(),
             }
 
 class StoryListTableWidget(QTableWidget):

@@ -60,11 +60,12 @@ from fanficfare import adapters, exceptions
 
 from fanficfare.epubutils import (
     get_dcsource, get_dcsource_chaptercount, get_story_url_from_epub_html,
-    get_story_url_from_zip_html, unnew_chapters_epub, get_cover_img)
+    get_story_url_from_zip_html, unnew_chapters_epub, get_cover_img,
+    get_update_data)
 
 from fanficfare.geturls import GetURLs
 
-from fanficfare.updategate import decide_update
+from fanficfare.updategate import decide_update, count_chapter_changes
 
 from fanficfare.fff_profile import do_cprofile
 
@@ -180,6 +181,7 @@ class FanFicFarePlugin(InterfaceAction):
 
         self.imap_pass = None
         self.download_job_manager = DownloadJobManager()
+        self.clear_retry_books()
 
     def initialization_complete(self):
         # otherwise configured hot keys won't work until the menu's
@@ -241,6 +243,8 @@ class FanFicFarePlugin(InterfaceAction):
         self.set_popup_mode()
         rejecturllist.clear_cache()
         self.imap_pass = None
+        # calibre_ids are only good for the library they came from.
+        self.clear_retry_books()
 
     def rebuild_menus(self):
         with self.menus_lock:
@@ -263,6 +267,19 @@ class FanFicFarePlugin(InterfaceAction):
             self.update_action = self.create_menu_item_ex(self.menu, _('&Update Existing FanFiction Books'), image='plusplus.png',
                                                           unique_name='&Update Existing FanFiction Books',
                                                           triggered=self.update_dialog)
+
+            self.check_action = self.create_menu_item_ex(self.menu, _('Check Selected Books for New Chapters'), image='search.png',
+                                                         unique_name='Check Selected Books for New Chapters',
+                                                         shortcut_name=_('Check Selected Books for New Chapters'),
+                                                         triggered=self.check_new_chapters)
+
+            retrytxt = _('Retry Failed Downloads')
+            if self.retry_books:
+                retrytxt = retrytxt + ' (%d)'%len(self.retry_books)
+            self.retry_action = self.create_menu_item_ex(self.menu, retrytxt, image='edit-redo.png',
+                                                         unique_name='Retry Failed Downloads',
+                                                         shortcut_name=_('Retry Failed Downloads'),
+                                                         triggered=self.retry_failed)
 
             self.get_list_imap_action = self.create_menu_item_ex(self.menu, _('Get Story URLs from &Email'), image='view.png',
                                                                  unique_name='Get Story URLs from IMAP',
@@ -1199,11 +1216,11 @@ class FanFicFarePlugin(InterfaceAction):
         #books = self.convert_calibre_ids_to_books(db, book_ids)
         #print("update books:%s"%books)
 
-    def update_dialog_finish(self,book_list,extraoptions={}):
+    def update_dialog_finish(self,book_list,extraoptions={},header=None):
         '''Present list to update and head to prep when done.'''
 
         d = UpdateExistingDialog(self.gui,
-                                 _('Update Existing List'),
+                                 header or _('Update Existing List'),
                                  prefs,
                                  self.qaction.icon(),
                                  book_list,
@@ -1220,7 +1237,188 @@ class FanFicFarePlugin(InterfaceAction):
         # only if there's some good ones.
         if any(x['good'] for x in update_books):
             options = d.get_fff_options()
+            # retrying stories from email keeps the email tags.
+            if 'add_tag' in extraoptions:
+                options['add_tag'] = extraoptions['add_tag']
             self.prep_downloads( options, update_books )
+
+    def check_new_chapters(self,checked):
+        '''Fetch metadata only for selected books and report which have
+        new chapters, without downloading or changing anything.'''
+        if not self.is_library_view():
+            self.do_status_message(_('Cannot Check Books from Device View'), 3000)
+            return
+
+        id_list = self.gui.library_view.get_selected_ids()
+        if len(id_list) == 0:
+            self.do_status_message(_('No Selected Books to Check'), 3000)
+            return
+
+        books = [ self.make_book_id_only(x) for x in id_list ]
+        for j, book in enumerate(books):
+            book['listorder'] = j
+
+        LoopProgressDialog(self.gui,
+                           books,
+                           partial(self.populate_book_from_calibre_id, db=self.gui.current_db),
+                           self.check_new_chapters_fetch,
+                           init_label=_("Collecting stories to check..."),
+                           win_title=_("Get stories to check"),
+                           status_prefix=_("URL retrieved"))
+
+    def check_new_chapters_fetch(self,book_list):
+        # new question_cache each time we start fetching metadata.
+        self.question_cache = {}
+        options = {'site_counts':defaultdict(int)}
+        for b in book_list:
+            options['site_counts'][b['site']] += 1
+
+        LoopProgressDialog(self.gui,
+                           book_list,
+                           partial(self.check_new_chapters_loop, options=options),
+                           self.check_new_chapters_finish,
+                           init_label=_("Checking stories for new chapters..."),
+                           win_title=_("Checking stories for new chapters"),
+                           status_prefix=_("Checked"))
+
+    def check_new_chapters_loop(self,book,options={},quit_fn=None):
+        if not book['good']:
+            # no story URL found, etc.
+            return
+        db = self.gui.current_db
+
+        # check existing epub first to save the network hit.
+        if not db.has_format(book['calibre_id'],'EPUB',index_is_id=True):
+            raise exceptions.NotGoingToDownload(_("No EPUB to compare chapters with."),'dialog_error.png')
+        updatedata = get_update_data(BytesIO(db.format(book['calibre_id'],'EPUB',
+                                                       index_is_id=True)))
+        chaptercount = updatedata[1]
+        oldchaptersmap = updatedata[7]
+        if chaptercount == 0:
+            raise exceptions.NotGoingToDownload(_("FanFicFare doesn't recognize chapters in existing epub, epub is probably from a different source. Use Overwrite to force update."),'dialog_error.png')
+
+        adapter = get_fff_adapter(book['url'],'epub')
+        configuration = self.share_caches(adapter,options)
+        self.tweak_fg_sleep(adapter,configuration,book,options)
+        configuration.set_quit(quit_fn)
+        self.get_story_metadata_only(adapter,options)
+
+        site_urls = [ x['url'] for x in adapter.get_chapters() ]
+        old_urls = [ adapter.normalize_chapterurl(x) for x in (oldchaptersmap or {}).keys() ]
+        (new_count,removed_count) = count_chapter_changes(chaptercount,old_urls,site_urls)
+
+        countsdict = {'new':new_count,
+                      'library':chaptercount,
+                      'site':len(site_urls)}
+        book['new_chapters'] = new_count
+        if new_count:
+            book['status'] = _('New Chapters')
+            book['icon'] = 'plusplus.png'
+            book['comment'] = _('%(new)d new chapters, %(library)d in library, %(site)d on web site.')%countsdict
+        else:
+            book['status'] = _('Up to Date')
+            book['icon'] = 'ok.png'
+            book['comment'] = _('No new chapters, %(library)d in library, %(site)d on web site.')%countsdict
+        if removed_count:
+            book['comment'] = book['comment'] + ' ' + \
+                _('%d chapters in library are no longer on web site.')%removed_count
+
+    def check_new_chapters_finish(self,book_list):
+        sort_func = lambda x : x['listorder']
+        new_list = sorted([ x for x in book_list if x['good'] and x['new_chapters'] ],key=sort_func)
+        current_list = sorted([ x for x in book_list if x['good'] and not x['new_chapters'] ],key=sort_func)
+        bad_list = sorted([ x for x in book_list if not x['good'] ],key=sort_func)
+
+        msgl = [ _('FanFicFare found <b>%(books)d</b> of %(total)d books with <b>%(chapters)d</b> new chapters.')%\
+                     {'books':len(new_list),
+                      'total':len(book_list),
+                      'chapters':sum(x['new_chapters'] for x in new_list)} ]
+        if bad_list:
+            msgl.append(_('<b>%d</b> books could not be checked.')%len(bad_list))
+
+        if new_list:
+            msgl.extend([_('See log for details.'),
+                         _('Update the books with new chapters now?')])
+            self.gui.proceed_question(lambda ids : self.update_dialog(False,id_list=ids),
+                                      [ x['calibre_id'] for x in new_list ],
+                                      books_htmllog(new_list+current_list+bad_list),
+                                      _('FanFicFare log'), _('FanFicFare check complete'),
+                                      '<p>'+'</p>\n<p>'.join(msgl)+ '</p>\n',
+                                      show_copy_button=False,
+                                      log_viewer_unique_name="FanFicFare log viewer")
+        else:
+            info_dialog(self.gui, _('FanFicFare check complete'),
+                        '<p>'+'</p>\n<p>'.join(msgl)+ '</p>\n',
+                        det_msg="\n".join([ "%s: %s (%s) %s"%(x['status'],x['title'],x['url'],x['comment'])
+                                            for x in current_list+bad_list ]),
+                        show=True,
+                        show_copy_button=False)
+
+    def clear_retry_books(self):
+        self.retry_books = []
+        self.retry_options = {}
+        self.retry_tdir = None
+
+    def save_retry_books(self,book_list,options):
+        '''Remember books that failed or had chapter errors so Retry
+        Failed Downloads can try them again.'''
+        ## Split BG jobs that aren't reconsolidated finish one at a
+        ## time.  Collect for the whole batch, start over on a new one.
+        if self.retry_tdir != options['tdir']:
+            self.clear_retry_books()
+            self.retry_tdir = options['tdir']
+        # not all of options, it can hold the caches and cookiejar.
+        self.retry_options = dict([ (k,options.get(k)) for k in ('fileform','collision','add_tag',
+                                                                 'ini_snippet','ini_snippet_name') ])
+        ## Keep the same book dicts so calibre_ids set when adding new
+        ## books with chapter errors to the library are seen.
+        self.retry_books.extend([ x for x in book_list
+                                  if 'chapter_error_count' in x or
+                                  (not x['good'] and x['status'] == _('Error')) ])
+
+    def retry_failed(self,checked):
+        '''Present books that failed or had chapter errors in the last
+        download in the update list again.'''
+        db = self.gui.current_db
+        books = []
+        for failed in self.retry_books:
+            if failed['calibre_id'] is not None:
+                if not db.new_api.has_id(failed['calibre_id']):
+                    continue # deleted since.
+                book = self.make_book_id_only(failed['calibre_id'])
+                self.populate_book_from_calibre_id(book,db)
+            else:
+                book = self.convert_url_to_book(failed['url'])
+                book['begin'] = failed['begin']
+                book['end'] = failed['end']
+            if book['good']:
+                # show why it failed last time.
+                book['comment'] = failed['comment']
+            book['listorder'] = len(books)
+            books.append(book)
+
+        if not books:
+            self.do_status_message(_('No Failed Downloads to Retry'), 3000)
+            return
+
+        options = self.retry_options
+        ## Update also adds stories not in the library and only fetches
+        ## missing and failed chapters.  Overwrite if Newer would skip
+        ## stories just written with chapter errors.
+        collision = {ADDNEW:UPDATE,
+                     SKIP:UPDATE,
+                     OVERWRITE:OVERWRITEALWAYS}.get(options['collision'],options['collision'])
+        if collision == UPDATE and options['fileform'] != 'epub':
+            collision = OVERWRITEALWAYS
+        extraoptions = {'collision':collision,
+                        'fileform':options['fileform'],
+                        'ini_snippet_name':options.get('ini_snippet_name'),
+                        'ini_snippet':options.get('ini_snippet')}
+        if options.get('add_tag'):
+            extraoptions['add_tag'] = options['add_tag']
+        self.update_dialog_finish(books,
+                                  extraoptions=extraoptions,
+                                  header=_('Retry Failed Downloads'))
 
     def get_urls_clip(self,storyurls=True):
         url_list = []
@@ -1338,6 +1536,33 @@ class FanFicFarePlugin(InterfaceAction):
                     rejecturllist.remove(url)
         return False
 
+    def share_caches(self,adapter,options):
+        '''Save and share caches and cookiejar between all downloads.'''
+        configuration = adapter.get_configuration()
+        if 'basic_cache' in options:
+            configuration.set_basic_cache(options['basic_cache'])
+        else:
+            options['basic_cache'] = configuration.get_basic_cache()
+        if 'cookiejar' in options:
+            configuration.set_cookiejar(options['cookiejar'])
+        else:
+            options['cookiejar'] = configuration.get_cookiejar()
+        return configuration
+
+    def tweak_fg_sleep(self,adapter,configuration,book,options):
+        '''Reduce foreground sleep time for configured sites when few books.'''
+        if adapter.getConfig('tweak_fg_sleep'):
+            minslp = float(adapter.getConfig('min_fg_sleep'))
+            maxslp = float(adapter.getConfig('max_fg_sleep'))
+            dwnlds = float(adapter.getConfig('max_fg_sleep_at_downloads'))
+            m = (maxslp-minslp) / (dwnlds-1)
+            b = minslp - m
+            slp = min(maxslp,m*float(options['site_counts'][book['site']])+b)
+            # logger.debug("tweak_fg_sleep count:%s"%options['site_counts'][book['site']])
+            # logger.debug("m:%s b:%s = %s"%(m,b,slp))
+            # logger.debug("tweak_fg_sleep: Set FG sleep override time %s"%slp)
+            configuration.set_sleep_override(slp)
+
     def get_story_metadata_only(self,adapter,options):
         url = adapter.url
 
@@ -1438,16 +1663,7 @@ class FanFicFarePlugin(InterfaceAction):
         ## chapter range for title_chapter_range_pattern
         adapter.setChaptersRange(book['begin'],book['end'])
 
-        ## save and share caches and cookiejar between all downloads.
-        configuration = adapter.get_configuration()
-        if 'basic_cache' in options:
-            configuration.set_basic_cache(options['basic_cache'])
-        else:
-            options['basic_cache'] = configuration.get_basic_cache()
-        if 'cookiejar' in options:
-            configuration.set_cookiejar(options['cookiejar'])
-        else:
-            options['cookiejar'] = configuration.get_cookiejar()
+        configuration = self.share_caches(adapter,options)
 
         if collision in (CALIBREONLY, CALIBREONLYSAVECOL):
             ## Getting metadata from configured column.
@@ -1480,18 +1696,7 @@ class FanFicFarePlugin(InterfaceAction):
             bgmeta = False
         else:
             if not bgmeta:
-                # reduce foreground sleep time for configured sites when few books.
-                if adapter.getConfig('tweak_fg_sleep'):
-                    minslp = float(adapter.getConfig('min_fg_sleep'))
-                    maxslp = float(adapter.getConfig('max_fg_sleep'))
-                    dwnlds = float(adapter.getConfig('max_fg_sleep_at_downloads'))
-                    m = (maxslp-minslp) / (dwnlds-1)
-                    b = minslp - m
-                    slp = min(maxslp,m*float(options['site_counts'][book['site']])+b)
-                    # logger.debug("tweak_fg_sleep count:%s"%options['site_counts'][book['site']])
-                    # logger.debug("m:%s b:%s = %s"%(m,b,slp))
-                    # logger.debug("tweak_fg_sleep: Set FG sleep override time %s"%slp)
-                    configuration.set_sleep_override(slp)
+                self.tweak_fg_sleep(adapter,configuration,book,options)
 
                 ## function that returns True if download should quit
                 ## with QuitDownloadException raised.
@@ -1896,11 +2101,10 @@ class FanFicFarePlugin(InterfaceAction):
                 _('See log for details.'),
                 _('Proceed with updating your library(Error or Last Checked Columns, if configured)?')]
 
-            htmllog='<html><body><table border="1"><tr><th>'+_('Status')+'</th><th>'+_('Title')+'</th><th>'+_('Author')+'</th><th>'+_('Comment')+'</th><th>URL</th></tr>'
-            for book in book_list:
-                htmllog = htmllog + '<tr><td>' + '</td><td>'.join([escapehtml(book['status']),escapehtml(book['title']),escapehtml(", ".join(book['author'])),escapehtml(book['comment']),book['url']]) + '</td></tr>'
+            htmllog = books_htmllog(book_list)
 
-            htmllog = htmllog + '</table></body></html>'
+            if not merge:
+                self.save_retry_books(book_list,options)
 
             payload = ([], book_list, options)
 
@@ -2236,11 +2440,7 @@ class FanFicFarePlugin(InterfaceAction):
 
             msgl.append(_('Proceed with updating this anthology and your library?'))
 
-            htmllog='<html><body><table border="1"><tr><th>'+_('Status')+'</th><th>'+_('Title')+'</th><th>'+_('Author')+'</th><th>'+_('Comment')+'</th><th>URL</th></tr>'
-            for book in sorted(good_list+bad_list,key=lambda x : x['listorder']):
-                htmllog = htmllog + '<tr><td>' + '</td><td>'.join([escapehtml(book['status']),escapehtml(book['title']),escapehtml(", ".join(book['author'])),escapehtml(book['comment']),book['url']]) + '</td></tr>'
-
-            htmllog = htmllog + '</table></body></html>'
+            htmllog = books_htmllog(sorted(good_list+bad_list,key=lambda x : x['listorder']))
 
             for book in bad_list:
                 if 'epub_for_update' in book:
@@ -2256,14 +2456,9 @@ class FanFicFarePlugin(InterfaceAction):
                     _('See log for details.'),
                     _('Proceed with updating your library?')])
 
-            htmllog='<html><body><table border="1"><tr><th>'+_('Status')+'</th><th>'+_('Title')+'</th><th>'+_('Author')+'</th><th>'+_('Comment')+'</th><th>URL</th></tr>'
-            for book in good_list:
-                htmllog = htmllog + '<tr><td>' + '</td><td>'.join([escapehtml(book['status']),escapehtml(book['title']),escapehtml(", ".join(book['author'])),escapehtml(book['comment']),book['url']]) + '</td></tr>'
+            htmllog = books_htmllog(good_list+bad_list)
 
-            for book in bad_list:
-                htmllog = htmllog + '<tr><td>' + '</td><td>'.join([escapehtml(book['status']),escapehtml(book['title']),escapehtml(", ".join(book['author'])),escapehtml(book['comment']),book['url']]) + '</td></tr>'
-
-            htmllog = htmllog + '</table></body></html>'
+            self.save_retry_books(book_list,options)
 
             do_update_func = self.do_download_list_update
 
@@ -3399,6 +3594,12 @@ def split_text_to_urls(urls):
         else:
             return False
     return [ x for x in urls.strip().splitlines() if f(x)]
+
+def books_htmllog(book_list):
+    htmllog='<html><body><table border="1"><tr><th>'+_('Status')+'</th><th>'+_('Title')+'</th><th>'+_('Author')+'</th><th>'+_('Comment')+'</th><th>URL</th></tr>'
+    for book in book_list:
+        htmllog = htmllog + '<tr><td>' + '</td><td>'.join([escapehtml(book['status']),escapehtml(book['title']),escapehtml(", ".join(book['author'])),escapehtml(book['comment']),book['url']]) + '</td></tr>'
+    return htmllog + '</table></body></html>'
 
 def escapehtml(txt):
     return txt.replace("&","&amp;").replace(">","&gt;").replace("<","&lt;")
