@@ -57,3 +57,42 @@ def count_chapter_changes(chaptercount, old_chapter_urls, site_chapter_urls):
                       if url not in old_chapter_urls ])
     removed_count = len(old_chapter_urls - set(site_chapter_urls))
     return (new_count, removed_count)
+
+## HTTP status codes that mean the story itself is gone, not that the
+## site is having trouble.
+STORY_GONE_STATUS_CODES = (404, 410)
+
+def is_story_gone_error(exc):
+    '''
+    True when exc says the story no longer exists on the site
+    (StoryDoesNotExist or an HTTP 404/410), as opposed to transient
+    failures like timeouts, Cloudflare blocks or 5xx errors.
+    '''
+    from .exceptions import StoryDoesNotExist, HTTPErrorFFF
+    if isinstance(exc, StoryDoesNotExist):
+        return True
+    if isinstance(exc, HTTPErrorFFF):
+        return exc.status_code in STORY_GONE_STATUS_CODES
+    return False
+
+def gone_step(prev_count, gone, good, threshold):
+    '''
+    Advance the consecutive "story gone" counter for one fetch attempt.
+    Returns (new_count, mark, unmark):
+
+      gone   -- count up; mark once the count reaches threshold.
+      good   -- the story was fetched fine: reset and unmark.
+      else   -- some other error: count unchanged, nothing to do.
+
+    mark is only True on the attempt that reaches threshold, and again
+    on later ones, so callers can (re)apply a mark that was removed by
+    hand.  unmark is True on every good fetch; callers only act on it
+    when the book is marked.
+    '''
+    prev_count = prev_count or 0
+    if gone:
+        count = prev_count + 1
+        return (count, count >= max(1, threshold), False)
+    if good:
+        return (0, False, True)
+    return (prev_count, False, False)

@@ -137,7 +137,7 @@ def do_download_for_worker(book,options,merge,notification=lambda x,y:x):
         from fanficfare import adapters, writers
         from fanficfare.epubutils import get_update_data
         from fanficfare.exceptions import NotGoingToDownload
-        from fanficfare.updategate import decide_update
+        from fanficfare.updategate import decide_update, count_chapter_changes, is_story_gone_error
 
         from calibre_plugins.fanficfare_plugin.fff_util import get_fff_config
 
@@ -197,6 +197,8 @@ def do_download_for_worker(book,options,merge,notification=lambda x,y:x):
                         continue
             if not story:
                 story = adapter.getStoryMetadataOnly()
+            ## story exists on the site, for 'story gone' detection.
+            book['story_found'] = True
 
             if not story.getMetadata("series") and 'calibre_series' in book:
                 adapter.setSeries(book['calibre_series'][0],book['calibre_series'][1])
@@ -321,6 +323,18 @@ def do_download_for_worker(book,options,merge,notification=lambda x,y:x):
                 # write & library update.  writeStory guards against a second
                 # fetch once the story is loaded.
                 adapter.getStory(notification)
+
+                ## Chapters in the existing epub that are no longer on
+                ## the site are dropped unless preserving deleted
+                ## chapters.  Not stopped here (no way to ask in BG),
+                ## noted in the comment; the previous version is kept
+                ## as a backup by the plugin if configured.
+                removed_count = 0
+                if not adapter.preserve_deleted_chapters():
+                    old_urls = [ adapter.normalize_chapterurl(x) for x in (adapter.oldchaptersmap or {}).keys() ]
+                    site_urls = [ x['url'] for x in adapter.get_chapters() ]
+                    (new_count,removed_count) = count_chapter_changes(chaptercount,old_urls,site_urls)
+
                 if book['collision'] == UPDATE and \
                         adapter.story.chapter_updated_count == 0 and \
                         adapter.story.chapter_added_count == 0 and \
@@ -372,6 +386,10 @@ def do_download_for_worker(book,options,merge,notification=lambda x,y:x):
                     else:
                         book['comment'] = _('Update %(fileform)s completed, added %(added)s chapters for %(total)s total.') % \
                             {'fileform': options['fileform'], 'added': added_count, 'total': total_count}
+                if removed_count:
+                    book['chapters_removed'] = removed_count
+                    book['comment'] = book['comment'] + ' ' + \
+                        _('%d chapters removed (no longer on web site).')%removed_count
                 book['all_metadata'] = story.getAllMetadata(removeallentities=True)
                 if options['savemetacol'] != '':
                     book['savemetacol'] = story.dump_html_metadata()
@@ -446,6 +464,7 @@ def do_download_for_worker(book,options,merge,notification=lambda x,y:x):
             book['comment']=str(e)
             book['icon']='dialog_error.png'
             book['status'] = _('Error')
+            book['story_gone'] = is_story_gone_error(e)
             logger.info("Exception: %s:%s"%(book,book['comment']),exc_info=True)
     return book
 

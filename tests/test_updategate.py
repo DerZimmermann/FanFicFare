@@ -63,3 +63,42 @@ def test_decide_update(chaptercount, urlchaptercount, kwargs, expected):
 ])
 def test_count_chapter_changes(chaptercount, old_urls, site_urls, expected):
     assert count_chapter_changes(chaptercount, old_urls, site_urls) == expected
+
+
+from fanficfare.exceptions import StoryDoesNotExist, HTTPErrorFFF, FailedToDownload
+from fanficfare.updategate import is_story_gone_error, gone_step
+
+
+@pytest.mark.parametrize('exc,expected', [
+    (StoryDoesNotExist('https://example.com/s/1'), True),
+    (HTTPErrorFFF('https://example.com/s/1', 404, 'Not Found'), True),
+    (HTTPErrorFFF('https://example.com/s/1', 410, 'Gone'), True),
+    # Site trouble, not a deleted story.
+    (HTTPErrorFFF('https://example.com/s/1', 503, 'Service Unavailable'), False),
+    (HTTPErrorFFF('https://example.com/s/1', 403, 'Forbidden'), False),
+    (FailedToDownload('timeout'), False),
+    (ValueError('x'), False),
+])
+def test_is_story_gone_error(exc, expected):
+    assert is_story_gone_error(exc) == expected
+
+
+@pytest.mark.parametrize('prev,gone,good,threshold,expected', [
+    # Counts up, marks when the threshold is reached.
+    (0, True, False, 3, (1, False, False)),
+    (1, True, False, 3, (2, False, False)),
+    (2, True, False, 3, (3, True, False)),
+    # Stays marked past the threshold.
+    (3, True, False, 3, (4, True, False)),
+    # Unset counter.
+    (None, True, False, 1, (1, True, False)),
+    # Threshold below 1 is treated as 1.
+    (0, True, False, 0, (1, True, False)),
+    # Good fetch resets and unmarks.
+    (5, False, True, 3, (0, False, True)),
+    # Other errors leave the counter alone.
+    (2, False, False, 3, (2, False, False)),
+    (None, False, False, 3, (0, False, False)),
+])
+def test_gone_step(prev, gone, good, threshold, expected):
+    assert gone_step(prev, gone, good, threshold) == expected

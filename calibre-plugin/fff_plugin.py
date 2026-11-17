@@ -65,7 +65,7 @@ from fanficfare.epubutils import (
 
 from fanficfare.geturls import GetURLs
 
-from fanficfare.updategate import decide_update, count_chapter_changes
+from fanficfare.updategate import decide_update, count_chapter_changes, gone_step
 
 from fanficfare.fff_profile import do_cprofile
 
@@ -78,6 +78,9 @@ from calibre_plugins.fanficfare_plugin.config import (
 
 from calibre_plugins.fanficfare_plugin.prefs import (
     prefs,
+    gone_data,
+    BACKUP_FMT_PREFIX,
+    GONE_TAG,
     SKIP,
     ADDNEW,
     UPDATE,
@@ -102,6 +105,9 @@ from calibre_plugins.fanficfare_plugin.dialogs import (
 # because calibre immediately transforms html into zip and don't want
 # to have an 'if html'.  db.has_format is cool with the case mismatch,
 # but if I'm doing it anyway...
+def is_backup_fmt(fmt):
+    return fmt.upper().startswith(BACKUP_FMT_PREFIX)
+
 formmapping = {
     'epub':'EPUB',
     'mobi':'MOBI',
@@ -427,6 +433,16 @@ class FanFicFarePlugin(InterfaceAction):
                                                             unique_name='Remove "(new)" chapter marks created by personal.ini <i>mark_new_chapters</i> setting.',
                                                             image='edit-undo.png',
                                                             triggered=self.unnew_books)
+
+            self.restore_backup_action = self.create_menu_item_ex(self.menu, _('Restore Pre-Update Backup of Selected Books'),
+                                                                  unique_name='Restore Pre-Update Backup',
+                                                                  image='edit-undo.png',
+                                                                  triggered=self.restore_backups)
+
+            self.delete_backup_action = self.create_menu_item_ex(self.menu, _('Delete Pre-Update Backups of Selected Books'),
+                                                                 unique_name='Delete Pre-Update Backups',
+                                                                 image='trash.png',
+                                                                 triggered=self.delete_backups)
 
             self.reject_list_action = self.create_menu_item_ex(self.menu, _('Reject Selected Books'),
                                                                unique_name='Reject Selected Books', image='rotate-right.png',
@@ -904,7 +920,7 @@ class FanFicFarePlugin(InterfaceAction):
                 if prefs['deleteotherforms']:
                     fmts = db.formats(book['calibre_id'], index_is_id=True).split(',')
                     for fmt in fmts:
-                        if fmt.lower() != formmapping['epub'].lower():
+                        if fmt.lower() != formmapping['epub'].lower() and not is_backup_fmt(fmt):
                             logger.debug("deleteotherforms remove f:"+fmt)
                             db.remove_format(book['calibre_id'], fmt, index_is_id=True)#, notify=False
                 elif prefs['autoconvert']:
@@ -924,6 +940,90 @@ class FanFicFarePlugin(InterfaceAction):
                 logger.debug(_('Starting auto conversion of %d books.')%(len(changed_ids)))
                 self.do_status_message(_('Starting auto conversion of %d books.')%(len(changed_ids)), 3000)
                 self.gui.iactions['Convert Books'].auto_convert_auto_add(changed_ids)
+
+    def get_selected_backup_ids(self):
+        if not self.is_library_view():
+            self.do_status_message(_('Pre-update backups are only available in the library'), 3000)
+            return []
+        ids = self.gui.library_view.get_selected_ids()
+        if not ids:
+            self.do_status_message(_('No Selected Books'), 3000)
+            return []
+        db = self.gui.current_db
+        have = [ x for x in ids if self.get_backup_fmts(db,x) ]
+        if not have:
+            info_dialog(self.gui, _('No Pre-Update Backups'),
+                        _('None of the %d selected books have a pre-update backup.')%len(ids),
+                        show=True, show_copy_button=False)
+        return have
+
+    def get_backup_fmts(self,db,book_id):
+        return [ x for x in (db.formats(book_id,index_is_id=True) or '').split(',')
+                 if x and is_backup_fmt(x) ]
+
+    def restore_backups(self,checked):
+        '''Swap the EPUB of selected books with the pre-update backup,
+        so restoring can be undone by restoring again.'''
+        book_ids = self.get_selected_backup_ids()
+        if not book_ids:
+            return
+        fmt = 'EPUB'
+        backup_fmt = BACKUP_FMT_PREFIX+fmt
+        if not question_dialog(self.gui, _('Restore Pre-Update Backups?'),
+                               '<p>'+'</p><p>'.join([
+                    _('Swap the %(fmt)s of %(count)d books with their pre-update backups (%(backup)s)?')%{'fmt':fmt,'count':len(book_ids),'backup':backup_fmt},
+                    _('The current %s is kept as the backup, so you can restore again to undo this.')%fmt,
+                    _("Calibre's metadata, like chapter counts and tags, is not changed and still matches the newer version."),
+                    _('Updating these books again will remove the same chapters again unless %s is set in personal.ini.')%'update_preserve_deleted_chapters:true',
+                    ])+'</p>',
+                               show_copy_button=False):
+            return
+        db = self.gui.current_db
+        tdir = PersistentTemporaryDirectory(prefix='fanficfare_')
+        restored = []
+        try:
+            with busy_cursor():
+                for book_id in book_ids:
+                    if not db.has_format(book_id,backup_fmt,index_is_id=True):
+                        continue
+                    backuptmp = PersistentTemporaryFile(prefix='backup-%s-'%book_id,
+                                                        suffix='.epub', dir=tdir)
+                    db.copy_format_to(book_id,backup_fmt,backuptmp,index_is_id=True)
+                    backuptmp.close()
+                    currenttmp = None
+                    if db.has_format(book_id,fmt,index_is_id=True):
+                        currenttmp = PersistentTemporaryFile(prefix='current-%s-'%book_id,
+                                                             suffix='.epub', dir=tdir)
+                        db.copy_format_to(book_id,fmt,currenttmp,index_is_id=True)
+                        currenttmp.close()
+                    # legacy add_format doesn't run file type plugins.
+                    db.add_format(book_id,fmt,backuptmp.name,index_is_id=True)
+                    if currenttmp:
+                        db.add_format(book_id,backup_fmt,currenttmp.name,index_is_id=True)
+                    else:
+                        db.remove_format(book_id,backup_fmt,index_is_id=True)
+                    restored.append(book_id)
+        finally:
+            remove_dir(tdir)
+            if restored:
+                self.gui.library_view.model().refresh_ids(restored)
+        self.do_status_message(_('Restored pre-update backups of %d books.')%len(restored), 3000)
+
+    def delete_backups(self,checked):
+        book_ids = self.get_selected_backup_ids()
+        if not book_ids:
+            return
+        if not question_dialog(self.gui, _('Delete Pre-Update Backups?'),
+                               '<p>'+_('Permanently delete the pre-update backups of %d books?')%len(book_ids)+'</p>',
+                               show_copy_button=False):
+            return
+        db = self.gui.current_db
+        with busy_cursor():
+            for book_id in book_ids:
+                for fmt in self.get_backup_fmts(db,book_id):
+                    db.remove_format(book_id,fmt,index_is_id=True)
+        self.gui.library_view.model().refresh_ids(book_ids)
+        self.do_status_message(_('Deleted pre-update backups of %d books.')%len(book_ids), 3000)
 
     def reject_list_urls(self,checked):
         if self.is_library_view():
@@ -1207,7 +1307,7 @@ class FanFicFarePlugin(InterfaceAction):
 
         LoopProgressDialog(self.gui,
                            books,
-                           partial(self.populate_book_from_calibre_id, db=self.gui.current_db),
+                           partial(self.populate_book_from_calibre_id, db=self.gui.current_db, skip_gone=True),
                            partial(self.update_dialog_finish,extraoptions=extraoptions),
                            init_label=_("Collecting stories for update..."),
                            win_title=_("Get stories for updates"),
@@ -1260,7 +1360,7 @@ class FanFicFarePlugin(InterfaceAction):
 
         LoopProgressDialog(self.gui,
                            books,
-                           partial(self.populate_book_from_calibre_id, db=self.gui.current_db),
+                           partial(self.populate_book_from_calibre_id, db=self.gui.current_db, skip_gone=True),
                            self.check_new_chapters_fetch,
                            init_label=_("Collecting stories to check..."),
                            win_title=_("Get stories to check"),
@@ -1282,6 +1382,8 @@ class FanFicFarePlugin(InterfaceAction):
                            status_prefix=_("Checked"))
 
     def check_new_chapters_loop(self,book,options={},quit_fn=None):
+        book.pop('story_gone',None)
+        book.pop('story_found',None)
         if not book['good']:
             # no story URL found, etc.
             return
@@ -1302,6 +1404,7 @@ class FanFicFarePlugin(InterfaceAction):
         self.tweak_fg_sleep(adapter,configuration,book,options)
         configuration.set_quit(quit_fn)
         self.get_story_metadata_only(adapter,options)
+        book['story_found'] = True
 
         site_urls = [ x['url'] for x in adapter.get_chapters() ]
         old_urls = [ adapter.normalize_chapterurl(x) for x in (oldchaptersmap or {}).keys() ]
@@ -1324,6 +1427,7 @@ class FanFicFarePlugin(InterfaceAction):
                 _('%d chapters in library are no longer on web site.')%removed_count
 
     def check_new_chapters_finish(self,book_list):
+        self.update_gone_status(book_list)
         sort_func = lambda x : x['listorder']
         new_list = sorted([ x for x in book_list if x['good'] and x['new_chapters'] ],key=sort_func)
         current_list = sorted([ x for x in book_list if x['good'] and not x['new_chapters'] ],key=sort_func)
@@ -1354,6 +1458,84 @@ class FanFicFarePlugin(InterfaceAction):
                         show=True,
                         show_copy_button=False)
 
+    def check_chapter_loss(self,adapter,book,chaptercount,oldchaptersmap):
+        '''Ask before an update drops chapters from the existing epub
+        that are no longer on the site.  Raises NotGoingToDownload if
+        declined.'''
+        site_urls = [ x['url'] for x in adapter.get_chapters() ]
+        old_urls = [ adapter.normalize_chapterurl(x) for x in (oldchaptersmap or {}).keys() ]
+        (new_count,removed_count) = count_chapter_changes(chaptercount,old_urls,site_urls)
+        if not removed_count:
+            return
+        book['chapters_removed'] = removed_count
+        if not prefs['warn_chapter_loss']:
+            return
+        if prefs['backup_before_update']:
+            backupmsg = _('The current version will be kept as format %s.')%(BACKUP_FMT_PREFIX+'EPUB')
+        else:
+            backupmsg = _('No backup will be kept, it is turned off in the configuration.')
+        if not question_dialog_all(self.gui,
+                                   _('Remove Chapters?'),'''
+                                     <h3>%s</h3>
+                                     <p>%s</p>
+                                     <p>%s</p>
+                                     <p>%s</p>
+                                     <p>%s</p>
+                                     <p>%s</p>'''%(_('Remove Chapters?'),
+                                                   _('<b>%(title)s</b> by <b>%(author)s</b>: %(removed)d chapters in your library are no longer on the web site and will be removed by this update.')%{'title':book['title'],'author':', '.join(book['author']),'removed':removed_count},
+                                                   backupmsg,
+                                                   _('Set %s in personal.ini to keep deleted chapters instead.')%'update_preserve_deleted_chapters:true',
+                                                   _("Click '<b>Yes</b>' to update anyway."),
+                                                   _("Click '<b>No</b>' to skip updating this book.")),
+                                   show_copy_button=False,
+                                   question_name='chapter_loss',
+                                   question_cache=self.question_cache):
+            raise exceptions.NotGoingToDownload(_('Update skipped: would remove %d chapters no longer on web site.')%removed_count,'edit-undo.png',showerror=False)
+
+    def update_gone_status(self,book_list):
+        '''Count attempts in a row that found a book's story gone from
+        the site, tag it GONE_TAG at the configured threshold, untag
+        and reset when the story is found again.'''
+        if not prefs['detect_gone']:
+            return
+        db = self.gui.current_db
+        counts = gone_data['gone_counts']
+        counts_changed = False
+        tagged_ids = []
+        for book in book_list:
+            book_id = book.get('calibre_id')
+            if not book_id or not db.new_api.has_id(book_id):
+                continue
+            key = str(book_id)
+            prev = counts.get(key,0)
+            (count,mark,unmark) = gone_step(prev,
+                                            book.get('story_gone',False),
+                                            book['good'] or book.get('story_found',False),
+                                            prefs['gone_threshold'])
+            if count != prev:
+                counts_changed = True
+                if count:
+                    counts[key] = count
+                else:
+                    counts.pop(key,None)
+            tags = list(db.new_api.field_for('tags',book_id))
+            if mark and GONE_TAG not in tags:
+                logger.info("Tagging %s after %d not found errors: %s"%(GONE_TAG,count,book['url']))
+                db.new_api.set_field('tags',{book_id:tags+[GONE_TAG]})
+                tagged_ids.append(book_id)
+                book['marked_gone'] = True
+                book['comment'] = book['comment'] + ' ' + \
+                    _("Tagged '%(tag)s' after %(count)d attempts in a row found the story gone.")%{'tag':GONE_TAG,'count':count}
+            elif unmark and GONE_TAG in tags:
+                logger.info("Removing %s, story found again: %s"%(GONE_TAG,book['url']))
+                db.new_api.set_field('tags',{book_id:[ t for t in tags if t != GONE_TAG ]})
+                tagged_ids.append(book_id)
+        if counts_changed:
+            gone_data['gone_counts'] = counts
+            gone_data.save_to_db()
+        if tagged_ids:
+            self.gui.library_view.model().refresh_ids(tagged_ids)
+
     def clear_retry_books(self):
         self.retry_books = []
         self.retry_options = {}
@@ -1373,8 +1555,9 @@ class FanFicFarePlugin(InterfaceAction):
         ## Keep the same book dicts so calibre_ids set when adding new
         ## books with chapter errors to the library are seen.
         self.retry_books.extend([ x for x in book_list
-                                  if 'chapter_error_count' in x or
-                                  (not x['good'] and x['status'] == _('Error')) ])
+                                  if not x.get('marked_gone') and
+                                  ('chapter_error_count' in x or
+                                   (not x['good'] and x['status'] == _('Error'))) ])
 
     def retry_failed(self,checked):
         '''Present books that failed or had chapter errors in the last
@@ -1638,6 +1821,10 @@ class FanFicFarePlugin(InterfaceAction):
         updatemeta= options['updatemeta']
         bgmeta= options['bgmeta']
 
+        ## for 'story gone' detection, books can be retried.
+        book.pop('story_gone',None)
+        book.pop('story_found',None)
+
         ## Check reject list.  Redundant with below for when story URL
         ## changes, but also kept here to avoid network hit in most
         ## common case where given url is story url.
@@ -1704,6 +1891,7 @@ class FanFicFarePlugin(InterfaceAction):
 
                 # logger.debug(options.get('frompage'))
                 story = self.get_story_metadata_only(adapter,options)
+                book['story_found'] = True
                 book['title'] = story.getMetadata('title')
                 book['author'] = [story.getMetadata('author')]
                 url = book['url'] = story.getMetadata('storyUrl', removeallentities=True)
@@ -1945,9 +2133,10 @@ class FanFicFarePlugin(InterfaceAction):
                     # 'book' can exist without epub.  If there's no existing epub,
                     # let it go and it will download it.
                     if db.has_format(book_id,fileform,index_is_id=True):
-                        (epuburl,chaptercount) = \
-                            get_dcsource_chaptercount(BytesIO(db.format(book_id,'EPUB',
-                                                                         index_is_id=True)))
+                        updatedata = get_update_data(BytesIO(db.format(book_id,'EPUB',
+                                                                       index_is_id=True)))
+                        chaptercount = updatedata[1]
+                        oldchaptersmap = updatedata[7]
                         # returns int adjusted for start-end range.
                         urlchaptercount = story.getChapterCount()
                         needs_edit_check = adapter.recheck_recent_chapters()
@@ -1964,6 +2153,9 @@ class FanFicFarePlugin(InterfaceAction):
                             raise exceptions.NotGoingToDownload(_("Existing epub contains %d chapters, web site only has %d. Use Overwrite or force_update_epub_always to force update.") % (chaptercount,urlchaptercount),'dialog_error.png')
                         elif update_decision == 'no_chapters':
                             raise exceptions.NotGoingToDownload(_("FanFicFare doesn't recognize chapters in existing epub, epub is probably from a different source. Use Overwrite to force update."),'dialog_error.png')
+
+                        if not preserve_deleted:
+                            self.check_chapter_loss(adapter,book,chaptercount,oldchaptersmap)
 
                 if collision == OVERWRITE and \
                         db.has_format(book_id,formmapping[fileform],index_is_id=True):
@@ -2101,6 +2293,7 @@ class FanFicFarePlugin(InterfaceAction):
                 _('See log for details.'),
                 _('Proceed with updating your library(Error or Last Checked Columns, if configured)?')]
 
+            self.update_gone_status(book_list)
             htmllog = books_htmllog(book_list)
 
             if not merge:
@@ -2406,6 +2599,8 @@ class FanFicFarePlugin(InterfaceAction):
         self.previous = self.gui.library_view.currentIndex()
         db = self.gui.current_db
 
+        self.update_gone_status(book_list)
+
         good_list = [ x for x in book_list if x['good'] ]
         bad_list = [ x for x in book_list if not x['good'] ]
         chapter_error_list = [ x for x in book_list if 'chapter_error_count' in  x ]
@@ -2681,6 +2876,9 @@ class FanFicFarePlugin(InterfaceAction):
             book['added'] = True
         else:
             book['added'] = False
+            if not self.backup_format(db,book,formmapping[options['fileform']]):
+                # don't replace the book without the backup.
+                return book_id
 
         try:
             # Remove before adding so the previous version is in the
@@ -2699,7 +2897,7 @@ class FanFicFarePlugin(InterfaceAction):
         if prefs['deleteotherforms']:
             fmts = db.formats(book['calibre_id'], index_is_id=True).split(',')
             for fmt in fmts:
-                if fmt.lower() != formmapping[options['fileform']].lower():
+                if fmt.lower() != formmapping[options['fileform']].lower() and not is_backup_fmt(fmt):
                     logger.debug("deleteotherforms remove f:"+fmt)
                     db.remove_format(book['calibre_id'], fmt, index_is_id=True)#, notify=False
         elif prefs['autoconvert']:
@@ -2714,6 +2912,32 @@ class FanFicFarePlugin(InterfaceAction):
 
 
         return book_id
+
+    def backup_format(self,db,book,fmt):
+        '''Keep the existing fmt of an existing book as
+        BACKUP_FMT_PREFIX+fmt before it's replaced, if configured.
+        Returns False and marks book bad if the backup failed.'''
+        book_id = book['calibre_id']
+        if not prefs['backup_before_update'] or \
+                not db.has_format(book_id,fmt,index_is_id=True):
+            return True
+        backup_fmt = BACKUP_FMT_PREFIX+fmt
+        try:
+            # legacy add_format doesn't run file type plugins.
+            with db.format(book_id,fmt,index_is_id=True,as_file=True) as existing:
+                if not db.add_format(book_id,backup_fmt,existing,index_is_id=True):
+                    raise Exception("add_format returned False")
+        except Exception as e:
+            logger.error("Saving %s backup failed for %s"%(backup_fmt,book['url']),exc_info=True)
+            book['comment'] = _("Saving backup of previous version failed, book not updated: %s")%e
+            book['good']=False
+            book['icon']='dialog_error.png'
+            book['status'] = _('Error')
+            return False
+        logger.debug("Saved %s backup for %s"%(backup_fmt,book['url']))
+        book['backup_saved'] = True
+        book['comment'] = book['comment'] + ' ' + _('Previous version saved as %s.')%backup_fmt
+        return True
 
     def set_custom(self,db,book_id,meta,val,label,commit=True):
         def raise_exception(meta,val,label,e):
@@ -3247,7 +3471,7 @@ class FanFicFarePlugin(InterfaceAction):
         book['good'] = False
         return book
 
-    def populate_book_from_calibre_id(self, book, db=None, quit_fn=None):
+    def populate_book_from_calibre_id(self, book, db=None, skip_gone=False, quit_fn=None):
         mi = db.get_metadata(book['calibre_id'], index_is_id=True)
         #book = {}
         book['good'] = True
@@ -3255,6 +3479,11 @@ class FanFicFarePlugin(InterfaceAction):
 
         url = self.get_story_url(db,book['calibre_id'])
         self.set_book_url_and_comment(book,url)
+        if skip_gone and book['good'] and GONE_TAG in (mi.tags or []):
+            book['good'] = False
+            book['status'] = _('Story Gone')
+            book['icon'] = 'dialog_error.png'
+            book['comment'] = _("Tagged '%s', remove the tag to try this story again.")%GONE_TAG
         #return book - populated passed in book.
 
     def set_book_url_and_comment(self,book,url):

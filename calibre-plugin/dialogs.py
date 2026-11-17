@@ -36,6 +36,7 @@ show_download_options = 'fff:add new/update dialogs:show_download_options'
 from calibre.gui2.dialogs.confirm_delete import confirm
 from calibre.gui2.complete2 import EditWithComplete
 from fanficfare.exceptions import NotGoingToDownload
+from fanficfare.updategate import is_story_gone_error
 from fanficfare.ensure import ensure_text
 from calibre_plugins.fanficfare_plugin.fff_util import make_safe_ini
 
@@ -898,6 +899,7 @@ class _LoopProgressDialog(QProgressDialog):
             book['good']=False
             book['status']=_("Error")
             book['comment']=str(e)
+            book['story_gone']=is_story_gone_error(e)
             logger.error("Exception: %s:%s"%(book,book['comment']),exc_info=True)
 
         self.updateStatus()

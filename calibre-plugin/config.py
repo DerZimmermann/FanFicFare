@@ -15,7 +15,7 @@ from PyQt5 import QtWidgets as QtGui
 from PyQt5.Qt import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
                       QLineEdit, QComboBox, QCheckBox, QPushButton, QTabWidget,
                       QScrollArea, QGroupBox, QButtonGroup, QRadioButton,
-                      Qt, QFont)
+                      QSpinBox, Qt, QFont)
 
 from calibre.gui2 import dynamic, info_dialog
 from calibre.gui2.complete2 import EditWithComplete
@@ -61,7 +61,7 @@ STD_COLS_SKIP = ['size','cover','news','ondevice','path','series_sort','sort']
 from calibre_plugins.fanficfare_plugin.prefs import (
     prefs, rejects_data, PREFS_NAMESPACE, prefs_save_options,
     updatecalcover_order, gencalcover_order, do_wordcount_order,
-    SAVE_YES, SAVE_NO)
+    SAVE_YES, SAVE_NO, BACKUP_FMT_PREFIX, GONE_TAG)
 
 from calibre_plugins.fanficfare_plugin.dialogs import (
     UPDATE, UPDATEALWAYS, collision_order, save_collisions, RejectListDialog,
@@ -288,6 +288,10 @@ class ConfigWidget(QWidget):
             prefs['button_instantpopup'] = self.basic_tab.button_instantpopup.isChecked()
             prefs['updatedefault'] = self.basic_tab.updatedefault.isChecked()
             prefs['deleteotherforms'] = self.basic_tab.deleteotherforms.isChecked()
+            prefs['backup_before_update'] = self.basic_tab.backup_before_update.isChecked()
+            prefs['warn_chapter_loss'] = self.basic_tab.warn_chapter_loss.isChecked()
+            prefs['detect_gone'] = self.basic_tab.detect_gone.isChecked()
+            prefs['gone_threshold'] = self.basic_tab.gone_threshold.value()
             prefs['adddialogstaysontop'] = self.basic_tab.adddialogstaysontop.isChecked()
             prefs['lookforurlinhtml'] = self.basic_tab.lookforurlinhtml.isChecked()
             prefs['checkforseriesurlid'] = self.basic_tab.checkforseriesurlid.isChecked()
@@ -551,6 +555,38 @@ class BasicTab(QWidget):
         self.lookforurlinhtml.setChecked(prefs['lookforurlinhtml'])
         self.l.addWidget(self.lookforurlinhtml)
 
+        prot_gb = groupbox = QGroupBox(_("Content Protection Options"))
+        self.l = QVBoxLayout()
+        groupbox.setLayout(self.l)
+
+        self.backup_before_update = QCheckBox(_('Keep a backup of the previous version when updating?'),self)
+        self.backup_before_update.setToolTip(_("Before an existing book's file is replaced by an update or overwrite, keep the previous version as format %s.\nUse 'Restore Pre-Update Backup' to swap it back in.")%(BACKUP_FMT_PREFIX+'EPUB'))
+        self.backup_before_update.setChecked(prefs['backup_before_update'])
+        self.l.addWidget(self.backup_before_update)
+
+        self.warn_chapter_loss = QCheckBox(_('Warn before updates remove chapters?'),self)
+        self.warn_chapter_loss.setToolTip(_("Ask before an update drops chapters from the book that are no longer on the web site.\nNot asked when Collect Metadata in Background is selected, the update's result notes it instead.\nNot needed with %s.")%'update_preserve_deleted_chapters:true')
+        self.warn_chapter_loss.setChecked(prefs['warn_chapter_loss'])
+        self.l.addWidget(self.warn_chapter_loss)
+
+        horz = QHBoxLayout()
+        self.detect_gone = QCheckBox(_('Tag stories gone from the web site after'),self)
+        self.detect_gone.setToolTip(_("After this many attempts in a row find the story doesn't exist (not found errors), tag the book '%s'.\nTagged books are skipped by Update and Check for New Chapters.  Remove the tag to try again.")%GONE_TAG)
+        self.detect_gone.setChecked(prefs['detect_gone'])
+        horz.addWidget(self.detect_gone)
+        self.gone_threshold = QSpinBox(self)
+        self.gone_threshold.setRange(1,99)
+        self.gone_threshold.setValue(prefs['gone_threshold'])
+        self.gone_threshold.setToolTip(self.detect_gone.toolTip())
+        self.gone_threshold.setEnabled(self.detect_gone.isChecked())
+        self.detect_gone.stateChanged.connect(lambda x : self.gone_threshold.setEnabled(self.detect_gone.isChecked()))
+        horz.addWidget(self.gone_threshold)
+        label = QLabel(_('failures'))
+        label.setBuddy(self.gone_threshold)
+        horz.addWidget(label)
+        horz.addStretch(1)
+        self.l.addLayout(horz)
+
         proc_gb = groupbox = QGroupBox(_("Post Processing Options"))
         self.l = QVBoxLayout()
         groupbox.setLayout(self.l)
@@ -705,6 +741,7 @@ class BasicTab(QWidget):
 
         vertleft = QVBoxLayout()
         vertleft.addWidget(cali_gb)
+        vertleft.addWidget(prot_gb)
         vertleft.addWidget(proc_gb)
 
         vertright = QVBoxLayout()

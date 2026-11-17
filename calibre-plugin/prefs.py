@@ -99,6 +99,12 @@ updatecalcover_order=[YES,YES_IF_IMG,NO]
 gencalcover_order=[YES,YES_UNLESS_IMG,NO]
 do_wordcount_order=[YES,YES_UNLESS_SITE,NO]
 
+## Previous versions of updated books are kept in format
+## BACKUP_FMT_PREFIX+fmt, eg FFF_BACKUP_EPUB.
+BACKUP_FMT_PREFIX = 'FFF_BACKUP_'
+## Not translated so it works across languages, same as 'FFF Frozen URL'.
+GONE_TAG = 'FFF Story Gone'
+
 PREFS_NAMESPACE = 'FanFicFarePlugin'
 PREFS_KEY_SETTINGS = 'settings'
 
@@ -169,6 +175,11 @@ default_prefs['gc_polish_cover'] = False
 
 default_prefs['countpagesstats'] = []
 default_prefs['wordcountmissing'] = False
+
+default_prefs['backup_before_update'] = True
+default_prefs['warn_chapter_loss'] = True
+default_prefs['detect_gone'] = True
+default_prefs['gone_threshold'] = 3
 
 default_prefs['errorcol'] = ''
 default_prefs['save_all_errors'] = True
@@ -289,3 +300,8 @@ prefs = PrefsFacade(setting=PREFS_KEY_SETTINGS,
 
 rejects_data = PrefsFacade(setting="rejects_data",
                            def_prefs={'rejecturls_data':[]})
+
+## Consecutive "story gone" (404/StoryDoesNotExist) counts by calibre
+## book id (str), for marking books with the GONE_TAG.
+gone_data = PrefsFacade(setting="gone_data",
+                        def_prefs={'gone_counts':{}})
