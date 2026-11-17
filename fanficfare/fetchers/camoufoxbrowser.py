@@ -18,10 +18,11 @@
 import logging
 logger = logging.getLogger(__name__)
 
+from contextlib import contextmanager
+from importlib.util import find_spec
 import threading
 
-## Currently, only works in Calibre.  Hopefully this will someday also
-## have CLI code.
+from .camoufoxbrowser_cli import Browser as CliCamoufoxBrowser
 
 ## Singleton code from:
 ## https://medium.com/analytics-vidhya/how-to-create-a-thread-safe-singleton-class-in-python-822e1170a7f6
@@ -29,7 +30,7 @@ class CamoufoxBrowserSingleton:
     _instance = None
     _lock = threading.Lock()
 
-    def __new__(cls):
+    def __new__(cls,warmup):
         if cls._instance is None:
             with cls._lock:
                 # Another thread could have created the instance
@@ -40,13 +41,16 @@ class CamoufoxBrowserSingleton:
                     cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self):
+    def __init__(self,warmup):
         # Only initialize once
         if not self._initialized:
-            logger.debug("Initializing camoufox singlton browser")
-            from calibre.web.automate.recipes import Browser as CamoufoxBrowser
+            logger.debug("Initializing Camoufox singleton browser")
+            if find_spec('calibre') is not None:
+                from calibre.web.automate.recipes import Browser as CamoufoxBrowser
+            else:
+                CamoufoxBrowser = CliCamoufoxBrowser
             self.browser = CamoufoxBrowser(
-                warmup=False,
+                warmup=warmup,
                 # user_agent=kwargs['user_agent'],
                 # verify_ssl_certificates=kwargs.get('verify_ssl_certificates', False),
                 # # A tab per download thread, so that the images of an article
@@ -58,6 +62,24 @@ class CamoufoxBrowserSingleton:
 
     def clone_browser(self):
         """A browser sharing this one's Camoufox instance but with a tab of its own."""
-        logger.debug("cloning camoufox singlton browser")
+        logger.debug("Cloning Camoufox singleton browser")
         return self.browser.clone_browser()
+
+
+@contextmanager
+def cli_browser_session():
+    """Bound standalone browser lifetime to one CLI invocation, even on error.
+
+    Calibre owns its browser's lifetime; leave it running for plugin jobs.
+    """
+    try:
+        yield
+    finally:
+        instance = CamoufoxBrowserSingleton._instance
+        if (instance is not None and instance._initialized and
+                isinstance(instance.browser, CliCamoufoxBrowser)):
+            try:
+                instance.browser.close()
+            finally:
+                CamoufoxBrowserSingleton._instance = None
 

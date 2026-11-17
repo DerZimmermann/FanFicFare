@@ -106,16 +106,12 @@ class TestGetChapterText(GenericAdapterTestGetChapterText):
 
     @pytest.fixture(autouse=True)
     def setup_env(self):
-        # getChapterText() uses get_request_redirected(), not the
-        # get_request() the generic test patches.  Patch the fetcher
-        # instead so no test fetches from the live site.
-        with patch.object(self.configuration, 'get_fetcher') as mock_get_fetcher:
-            self.fetcher = mock_get_fetcher.return_value
-            self.fetcher.get_request_redirected.return_value = (
-                self.fixture.encode('utf-8'), SPECIFIC_TEST_DATA['chapter_url'])
+        with patch(f'fanficfare.adapters.{self.path_adapter}.get_request_redirected') as mock_request:
+            mock_request.return_value = (self.fixture, self.expected_data['chapter_url'])
             yield
 
-    def test_it_handles_zipped_chapters(self):
+    @patch('fanficfare.adapters.adapter_fanfictionsfr.FanfictionsFrSiteAdapter.get_request_redirected')
+    def test_it_handles_zipped_chapters(self, mockget_request_redirected):
         expected_sentences = [
             "Elle a écrite avant la reprise de next gen –Shippuuden maintenant-, quand on ne savait encore rien de l’évolution des personnages.",
             "\" Commandant, il faudrait que vous me suiviez à l'infirmerie… \"",
@@ -123,14 +119,15 @@ class TestGetChapterText(GenericAdapterTestGetChapterText):
         ]
 
         # Given
-        zip_file_path = "tests/fixtures_fanfictionsfr_zipfic.zip"  # Replace with the path to your zip file
+        zip_file_path = "tests/fixtures_fanfictionsfr_zipfic.zip"
         with open(zip_file_path, 'rb') as f:
-            zip_data = f.read()  # Read the zip file as binary data
+            zip_data = f.read()
 
-        self.fetcher.get_request_redirected.return_value = (zip_data, "https://www.fanfictions.fr/fanfictions/naruto/232_crise/683_kiba/telecharger_pdf.html")
+        # get_request_redirected returns decoded text and the final URL.
+        mockget_request_redirected.return_value = (zip_data.decode('latin1'), "https://fanfictions.fr/fanfictions/naruto/232_crise/683_kiba/telecharger_pdf.html")
 
         # When
-        response = self.adapter.getChapterText("https://www.fanfictions.fr/fanfictions/naruto/232_crise/683_kiba/lire.html")
+        response = self.adapter.getChapterText("https://fanfictions.fr/fanfictions/naruto/232_crise/683_kiba/lire.html")
 
         # Then
         for p in expected_sentences:
