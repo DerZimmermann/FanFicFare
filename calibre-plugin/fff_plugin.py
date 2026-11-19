@@ -19,7 +19,8 @@ from functools import partial
 from datetime import datetime, time
 from string import Template
 import traceback
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from urllib.parse import urlparse
 
 from PyQt5.Qt import (QApplication, QMenu, QTimer, QToolButton, pyqtSignal, QEventLoop)
 
@@ -64,6 +65,8 @@ from fanficfare.epubutils import (
     get_update_data)
 
 from fanficfare.geturls import GetURLs
+from fanficfare.discover import (ao3_author_works_url, build_tag_profile,
+                                 make_ao3_search_urls, score_candidates)
 
 from fanficfare.updategate import decide_update, count_chapter_changes, gone_step
 
@@ -79,6 +82,7 @@ from calibre_plugins.fanficfare_plugin.config import (
 from calibre_plugins.fanficfare_plugin.prefs import (
     prefs,
     gone_data,
+    followed_data,
     BACKUP_FMT_PREFIX,
     GONE_TAG,
     SKIP,
@@ -98,7 +102,7 @@ from calibre_plugins.fanficfare_plugin.dialogs import (
     AddNewDialog, UpdateExistingDialog,
     LoopProgressDialog, UserPassDialog, AboutDialog, CollectURLDialog,
     RejectListDialog, EmailPassDialog, TOTPDialog,
-    save_collisions, question_dialog_all,
+    save_collisions, question_dialog_all, StoryPickerDialog,
     RejectUrlEntry, IniTextDialog,
     EditTextDialog, ModalDialog)
 
@@ -302,6 +306,29 @@ class FanFicFarePlugin(InterfaceAction):
                                                             triggered=self.list_story_urls)
             self.menu.addSeparator()
             anth_on = bool(self.get_epubmerge_plugin())
+            self.discover_sub_menu = self.menu.addMenu(_('Discover New Stories'))
+            self.find_series_action = self.create_menu_item_ex(self.discover_sub_menu, _('Find Missing Series Parts of Selected Books'),
+                                                               unique_name='Find Missing Series Parts',
+                                                               image='search.png',
+                                                               triggered=self.find_missing_series_parts)
+            self.find_similar_action = self.create_menu_item_ex(self.discover_sub_menu, _('Find Similar Stories on AO3 to Selected Books'),
+                                                                unique_name='Find Similar Stories on AO3',
+                                                                image='search.png',
+                                                                triggered=self.find_similar_stories)
+            self.discover_sub_menu.addSeparator()
+            self.follow_authors_action = self.create_menu_item_ex(self.discover_sub_menu, _('Follow Authors of Selected Books'),
+                                                                  unique_name='Follow Authors of Selected Books',
+                                                                  image='plus.png',
+                                                                  triggered=self.follow_authors)
+            self.check_followed_action = self.create_menu_item_ex(self.discover_sub_menu, _('Check Followed Authors for New Stories'),
+                                                                  unique_name='Check Followed Authors for New Stories',
+                                                                  image='view.png',
+                                                                  triggered=self.check_followed_authors)
+            self.edit_followed_action = self.create_menu_item_ex(self.discover_sub_menu, _('Edit Followed Authors'),
+                                                                 unique_name='Edit Followed Authors',
+                                                                 image='edit-select-all.png',
+                                                                 triggered=self.edit_followed_authors)
+
             self.anth_sub_menu = self.menu.addMenu(_('Anthology Options'))
             self.get_anthlist_url_action = self.create_menu_item_ex(self.anth_sub_menu, _('Make Anthology Epub from Web Page'),
                                                                     image='view.png',
@@ -1458,6 +1485,348 @@ class FanFicFarePlugin(InterfaceAction):
                         show=True,
                         show_copy_button=False)
 
+    ## ---------------- Discover New Stories ----------------
+
+    def discover_selected_books(self):
+        '''Selected library books, populated, with site counts for
+        tweak_fg_sleep in options.'''
+        if not self.is_library_view():
+            self.do_status_message(_('Can only discover stories from books in library'), 3000)
+            return (None,None)
+        id_list = self.gui.library_view.get_selected_ids()
+        if not id_list:
+            self.do_status_message(_('No Selected Books'), 3000)
+            return (None,None)
+        db = self.gui.current_db
+        options = {'site_counts':defaultdict(int)}
+        books = []
+        for j, book_id in enumerate(id_list):
+            book = self.make_book_id_only(book_id)
+            book['listorder'] = j
+            self.populate_book_from_calibre_id(book, db=db)
+            if book['good']:
+                options['site_counts'][book['site']] += 1
+            books.append(book)
+        ## no frompage storydata, always fetch story metadata.
+        self.question_cache = {}
+        return (books,options)
+
+    def get_link_map(self,field):
+        db = self.gui.current_db
+        ## new_api.get_link_map added in Calibre v6.15
+        if hasattr(db.new_api,'get_link_map'):
+            return db.new_api.get_link_map(field)
+        return {}
+
+    def discover_fetch_metadata(self,book,options,quit_fn=None):
+        adapter = get_fff_adapter(book['url'],'epub')
+        configuration = self.share_caches(adapter,options)
+        self.tweak_fg_sleep(adapter,configuration,book,options)
+        configuration.set_quit(quit_fn)
+        return self.get_story_metadata_only(adapter,options)
+
+    def discover_get_urls(self,url,options):
+        '''get_urls_from_page() sharing caches and cookies (logins)
+        between pages.'''
+        configuration = self.share_config_caches(get_fff_config(url),options)
+        geturls = GetURLs(configuration,get_fff_config)
+        return run_off_gui_thread(geturls.get_urls_from_page,url)
+
+    def discover_candidate(self,url,metadata):
+        def joinv(val):
+            if isinstance(val,(list,tuple)):
+                return ', '.join(val)
+            return '' if val is None else str(val)
+        return {'url':url,
+                'title':joinv(metadata.get('title')),
+                'author':joinv(metadata.get('author')),
+                'fandoms':joinv(metadata.get('fandoms') or metadata.get('category')),
+                'words':joinv(metadata.get('numWords')),
+                'chapters':joinv(metadata.get('chapterslashtotal') or metadata.get('numChapters')),
+                'status':joinv(metadata.get('status')),
+                'kudos':joinv(metadata.get('kudos')),
+                'metadata':metadata,
+                'reasons':[]}
+
+    def discover_add_candidates(self,candidates,frompage,reason):
+        '''Add frompage's stories to candidates {normalized url:candidate}.'''
+        sdmap = {}
+        for sd in frompage.get('storydata') or []:
+            if sd.get('storyUrl'):
+                sdmap[adapters.getNormalStoryURL(sd['storyUrl'])] = sd
+        for url in frompage.get('urllist',[]):
+            url = adapters.getNormalStoryURL(url)
+            if not url:
+                continue
+            if url not in candidates:
+                candidates[url] = self.discover_candidate(url,sdmap.get(url,{}))
+            if reason not in candidates[url]['reasons']:
+                candidates[url]['reasons'].append(reason)
+
+    def discover_page_loop(self,item,options={},candidates=None,quit_fn=None):
+        '''item: {'url','reason'} of a series/author/search page.'''
+        frompage = self.discover_get_urls(item['url'],options)
+        item['found'] = len(frompage.get('urllist',[]))
+        self.discover_add_candidates(candidates,frompage,item['reason'])
+
+    def discover_filter(self,candidates):
+        '''Drop stories already in library or on the reject list.
+        Returns (kept, count in library, count rejected).'''
+        kept = []
+        inlib = rejected = 0
+        with busy_cursor():
+            for cand in candidates:
+                if self.do_id_search(cand['url']):
+                    inlib += 1
+                elif rejecturllist.check(cand['url']):
+                    rejected += 1
+                else:
+                    kept.append(cand)
+        return (kept,inlib,rejected)
+
+    def discover_message(self,found,inlib,rejected,failed_items):
+        msgl = [ _('Found %(found)d stories, %(inlib)d already in your library, %(rejected)d on your reject list.')%\
+                     {'found':found,'inlib':inlib,'rejected':rejected} ]
+        if failed_items:
+            msgl.append(_('%d pages or books could not be fetched:')%len(failed_items))
+            msgl.extend([ '%s: %s'%(x.get('url'),x.get('comment')) for x in failed_items ])
+        return msgl
+
+    def discover_show(self,title,kept,msgl,checked=False):
+        if not kept:
+            info_dialog(self.gui, title,
+                        '<p>'+_('No new stories found.')+'</p><p>'+'</p><p>'.join(msgl)+'</p>',
+                        show=True, show_copy_button=False)
+            return
+        d = StoryPickerDialog(self.gui, title, '\n'.join(msgl), kept,
+                              icon=self.qaction.icon(), checked=checked)
+        d.exec_()
+        if d.result() != d.Accepted:
+            return
+        urls = d.get_urls()
+        if urls:
+            self.add_dialog(False,"\n".join(urls),merge=False)
+
+    def discover_pages(self,items,options,title,finish_function):
+        '''Fetch series/author/search pages in items, then
+        finish_function(items,candidates).'''
+        candidates = OrderedDict()
+        LoopProgressDialog(self.gui,
+                           items,
+                           partial(self.discover_page_loop,options=options,candidates=candidates),
+                           lambda item_list : finish_function(item_list,candidates),
+                           init_label=_("Fetching story lists..."),
+                           win_title=title,
+                           status_prefix=_("Pages fetched"))
+
+    def discover_finish_simple(self,item_list,candidates,title,checked=False,failed=[]):
+        (kept,inlib,rejected) = self.discover_filter(list(candidates.values()))
+        msgl = self.discover_message(len(candidates),inlib,rejected,
+                                     failed+[ x for x in item_list if not x['good'] ])
+        self.discover_show(title,kept,msgl,checked=checked)
+
+    ## -- Missing series parts
+
+    def find_missing_series_parts(self,checked):
+        (books,options) = self.discover_selected_books()
+        if not books:
+            return
+        options['series_links'] = self.get_link_map('series')
+        series = OrderedDict()
+        LoopProgressDialog(self.gui,
+                           books,
+                           partial(self.find_series_loop,options=options,series=series),
+                           partial(self.find_series_finish,options=options,series=series),
+                           init_label=_("Collecting series..."),
+                           win_title=_("Find Missing Series Parts"),
+                           status_prefix=_("Books checked"))
+
+    def find_series_loop(self,book,options={},series=None,quit_fn=None):
+        if not book['good']:
+            return
+        db = self.gui.current_db
+        name = db.new_api.field_for('series',book['calibre_id'])
+        link = options['series_links'].get(name) if name else None
+        if link:
+            series.setdefault(link,name)
+            return
+        ## no series link in calibre, get series URLs from the story.
+        story = self.discover_fetch_metadata(book,options,quit_fn)
+        found = False
+        for i in range(0,10):
+            url = story.getMetadataRaw('series%02dUrl'%i)
+            if url:
+                found = True
+                sname = story.getMetadataRaw('series%02d'%i) or url
+                series.setdefault(url,re.sub(r' \[[\d.]+\]$','',sname))
+        if not found and story.getMetadataRaw('seriesUrl'):
+            found = True
+            series.setdefault(story.getMetadataRaw('seriesUrl'),name or story.getMetadataRaw('series') or '')
+        if not found:
+            book['comment'] = _('No series found.')
+
+    def find_series_finish(self,book_list,options={},series=None):
+        title = _("Find Missing Series Parts")
+        failed = [ x for x in book_list if not x['good'] ]
+        if not series:
+            info_dialog(self.gui, title,
+                        '<p>'+_('No series found for the %d selected books.')%len(book_list)+'</p>',
+                        show=True, show_copy_button=False)
+            return
+        items = [ {'url':url,'title':name,'good':True,
+                   'reason':_('Series: %s')%name} for url, name in series.items() ]
+        self.discover_pages(items,options,title,
+                            partial(self.discover_finish_simple,title=title,checked=True,failed=failed))
+
+    ## -- Followed authors
+
+    def follow_authors(self,checked):
+        (books,options) = self.discover_selected_books()
+        if not books:
+            return
+        options['author_links'] = self.get_link_map('authors')
+        authors = OrderedDict()
+        LoopProgressDialog(self.gui,
+                           books,
+                           partial(self.follow_authors_loop,options=options,authors=authors),
+                           partial(self.follow_authors_finish,authors=authors),
+                           init_label=_("Collecting authors..."),
+                           win_title=_("Follow Authors"),
+                           status_prefix=_("Books checked"))
+
+    def follow_authors_loop(self,book,options={},authors=None,quit_fn=None):
+        if not book['good']:
+            return
+        db = self.gui.current_db
+        names = db.new_api.field_for('authors',book['calibre_id'])
+        links = [ (options['author_links'].get(name),name) for name in names ]
+        if not all(link for (link,name) in links):
+            ## no author links in calibre, get them from the story.
+            story = self.discover_fetch_metadata(book,options,quit_fn)
+            links = list(zip(story.getList('authorUrl'),story.getList('author')))
+        for (link,name) in links:
+            ## AO3 Anonymous has the site as authorUrl.
+            if link and urlparse(link).path.strip('/'):
+                authors.setdefault(link,name)
+
+    def follow_authors_finish(self,book_list,authors=None):
+        followed = followed_data['authors']
+        known = set( x['url'] for x in followed )
+        added = [ {'url':url,'name':name,'site':urlparse(url).netloc}
+                  for url, name in authors.items() if url not in known ]
+        if added:
+            followed_data['authors'] = followed + added
+            followed_data.save_to_db()
+        msgl = [ _('Now following %(added)d more authors, %(total)d in all.')%\
+                     {'added':len(added),'total':len(followed)+len(added)} ]
+        failed = [ x for x in book_list if not x['good'] ]
+        if failed:
+            msgl.append(_('%d books could not be checked:')%len(failed))
+            msgl.extend([ '%s: %s'%(x['title'],x['comment']) for x in failed ])
+        info_dialog(self.gui, _('Follow Authors'),
+                    '<p>'+'</p><p>'.join(msgl)+'</p>',
+                    show=True, show_copy_button=False)
+
+    def check_followed_authors(self,checked):
+        title = _("Check Followed Authors for New Stories")
+        followed = followed_data['authors']
+        if not followed:
+            info_dialog(self.gui, title,
+                        '<p>'+_('You are not following any authors yet.  Use Follow Authors of Selected Books first.')+'</p>',
+                        show=True, show_copy_button=False)
+            return
+        ## new question_cache each time we start fetching.
+        self.question_cache = {}
+        items = [ {'url':ao3_author_works_url(x['url']) or x['url'],
+                   'title':x['name'],'good':True,
+                   'reason':_('Author: %s')%x['name']} for x in followed ]
+        self.discover_pages(items,{},title,
+                            partial(self.discover_finish_simple,title=title))
+
+    def edit_followed_authors(self,checked):
+        followed = followed_data['authors']
+        d = EditTextDialog(self.gui,
+                           "\n".join([ "%s %s"%(x['url'],x['name']) for x in followed ]),
+                           icon=self.qaction.icon(),
+                           title=_("Edit Followed Authors"),
+                           label=_("Followed authors, one per line: the author's URL, then their name."),
+                           save_size_name='fff:edit followed authors')
+        d.exec_()
+        if d.result() != d.Accepted:
+            return
+        authors = []
+        known = set()
+        for line in d.get_plain_text().splitlines():
+            parts = line.strip().split(None,1)
+            if not parts or not parts[0].startswith('http') or parts[0] in known:
+                continue
+            known.add(parts[0])
+            authors.append({'url':parts[0],
+                            'name':parts[1] if len(parts) > 1 else parts[0],
+                            'site':urlparse(parts[0]).netloc})
+        followed_data['authors'] = authors
+        followed_data.save_to_db()
+
+    ## -- Similar stories on AO3
+
+    def find_similar_stories(self,checked):
+        (books,options) = self.discover_selected_books()
+        if not books:
+            return
+        ao3books = [ x for x in books if x['good'] and x['site'] == 'archiveofourown.org' ]
+        if not ao3books:
+            info_dialog(self.gui, _("Find Similar Stories on AO3"),
+                        '<p>'+_('None of the %d selected books are from AO3.')%len(books)+'</p>',
+                        show=True, show_copy_button=False)
+            return
+        LoopProgressDialog(self.gui,
+                           ao3books,
+                           partial(self.find_similar_loop,options=options),
+                           partial(self.find_similar_search,options=options,skipped=len(books)-len(ao3books)),
+                           init_label=_("Collecting tags..."),
+                           win_title=_("Find Similar Stories on AO3"),
+                           status_prefix=_("Books checked"))
+
+    def find_similar_loop(self,book,options={},quit_fn=None):
+        story = self.discover_fetch_metadata(book,options,quit_fn)
+        book['discover_metadata'] = dict(story.metadata)
+
+    def find_similar_search(self,book_list,options={},skipped=0):
+        title = _("Find Similar Stories on AO3")
+        profile = build_tag_profile([ x['discover_metadata'] for x in book_list
+                                      if 'discover_metadata' in x ])
+        urls = make_ao3_search_urls(profile)
+        failed = [ x for x in book_list if not x['good'] ]
+        if not urls:
+            info_dialog(self.gui, title,
+                        '<p>'+_('No tags found to search for.')+'</p>',
+                        show=True, show_copy_button=False)
+            return
+        items = [ {'url':url,'title':url,'good':True,
+                   'reason':_('AO3 search')} for url in urls ]
+        self.discover_pages(items,options,title,
+                            partial(self.find_similar_finish,title=title,profile=profile,
+                                    failed=failed,skipped=skipped))
+
+    def find_similar_finish(self,item_list,candidates,title=None,profile=None,failed=[],skipped=0):
+        (kept,inlib,rejected) = self.discover_filter(list(candidates.values()))
+        scored = score_candidates(profile,[ x['metadata'] for x in kept ],
+                                  limit=prefs['discover_max_results'])
+        bymetadata = dict( (id(x['metadata']),x) for x in kept )
+        ranked = []
+        for (score,matched,metadata) in scored:
+            cand = bymetadata[id(metadata)]
+            cand['reasons'] = [ _('Score %(score).2f, shared tags: %(tags)s')%\
+                                    {'score':score,'tags':', '.join(matched)} ]
+            ranked.append(cand)
+        msgl = self.discover_message(len(candidates),inlib,rejected,
+                                     failed+[ x for x in item_list if not x['good'] ])
+        if skipped:
+            msgl.append(_('%d selected books are not from AO3 and were skipped.')%skipped)
+        msgl.append(_('Showing the best %(shown)d of %(new)d new stories by shared tags.')%\
+                        {'shown':len(ranked),'new':len(kept)})
+        self.discover_show(title,ranked,msgl)
+
     def check_chapter_loss(self,adapter,book,chaptercount,oldchaptersmap):
         '''Ask before an update drops chapters from the existing epub
         that are no longer on the site.  Raises NotGoingToDownload if
@@ -1721,7 +2090,9 @@ class FanFicFarePlugin(InterfaceAction):
 
     def share_caches(self,adapter,options):
         '''Save and share caches and cookiejar between all downloads.'''
-        configuration = adapter.get_configuration()
+        return self.share_config_caches(adapter.get_configuration(),options)
+
+    def share_config_caches(self,configuration,options):
         if 'basic_cache' in options:
             configuration.set_basic_cache(options['basic_cache'])
         else:

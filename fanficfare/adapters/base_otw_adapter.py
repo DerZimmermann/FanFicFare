@@ -19,6 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 import re
 import json
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 from ..htmlcleanup import stripHTML
 from .. import exceptions as exceptions
@@ -739,6 +740,75 @@ class BaseOTWAdapter(BaseSiteAdapter):
             elif 'Complete:No' in stats:
                 retval['status'] = "In-Progress"
             return retval
-        # wasn't a /series/ url.  Causes base_adapter to do normal
-        # ...from_page
+        if self.is_listing_url(url):
+            return self.get_listing_from_page(url,data)
+        # wasn't a /series/ or list url.  Causes base_adapter to do
+        # normal ...from_page
         return {}
+
+    def is_listing_url(self,url):
+        '''
+        True for list pages of work blurbs: an author's works, a tag's
+        works, a collection's works and work searches/filters.
+        '''
+        domains = r"|".join([x.replace('.',r'\.') for x in self.getAcceptDomains()])
+        return re.match(r"https?://("+domains+r")"
+                        r"(/users/[^/?#]+(/pseuds/[^/?#]+)?/works"
+                        r"|/tags/[^?#]+/works"
+                        r"|/collections/[^/?#]+/works"
+                        r"|/works/search"
+                        r"|/works)/?([?#].*)?$",url) is not None
+
+    def get_listing_from_page(self,url,data):
+        '''
+        Story URLs and blurb metadata from a list page of works, up to
+        max_listing_pages pages of it.
+        '''
+        def get_page_url(pagenum):
+            ## keep other params, search URLs depend on them.
+            parts = urlparse(url)
+            query = [ (k,v) for (k,v) in parse_qsl(parts.query,keep_blank_values=True)
+                      if k != 'page' ]
+            query.append(('page',str(pagenum)))
+            return urlunparse(parts._replace(query=urlencode(query),fragment=''))
+
+        def get_page_num(href):
+            try:
+                return int(dict(parse_qsl(urlparse(href).query)).get('page','1'))
+            except ValueError:
+                return 1
+
+        urllist = []
+        storydata = []
+        def do_blurbs_loop(soup):
+            for blurb in soup.select('li.work.blurb'):
+                self.reset_story()
+                self.set_story_metadata(blurb)
+                storyurl = self.story.getMetadataRaw('storyUrl')
+                if storyurl and storyurl not in urllist:
+                    storydata.append(self.story.metadata)
+                    urllist.append(storyurl)
+
+        soup = self.make_soup(data)
+        startpage = get_page_num(url)
+        maxpage = max([startpage]+[ get_page_num(a['href'])
+                                    for a in soup.select("ol.pagination li a[href]") ])
+        try:
+            maxpages = int(self.getConfig('max_listing_pages',5))
+        except ValueError:
+            maxpages = 5
+        lastpage = min(maxpage, startpage + max(1,maxpages) - 1)
+        logger.debug("listing pages %s-%s of %s: %s"%(startpage,lastpage,maxpage,url))
+
+        do_blurbs_loop(soup)
+        for pagenum in range(startpage+1,lastpage+1):
+            pageurl = get_page_url(pagenum)
+            logger.debug("doing listing page: %s"%pageurl)
+            do_blurbs_loop(self.make_soup(self.get_request(pageurl)))
+
+        retval = {'urllist':urllist,
+                  'storydata':storydata}
+        heading = soup.select_one('h2.heading')
+        if heading:
+            retval['name'] = stripHTML(heading)
+        return retval

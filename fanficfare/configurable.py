@@ -239,6 +239,7 @@ def get_valid_set_options():
                'use_workskin':(otw_list,None,boollist),
                'remove_authorfootnotes_on_update':(otw_list,None,boollist),
                'use_series_page_metadata':(otw_list,None,boollist),
+               'max_listing_pages':(otw_list,None,None),
                'use_archive_transformativeworks_org':(['archiveofourown.org'],None,boollist),
                'use_archiveofourown_gay':(['archiveofourown.org'],None,boollist),
 

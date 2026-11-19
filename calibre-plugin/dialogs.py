@@ -1408,6 +1408,99 @@ class RejectListTableWidget(QTableWidget):
         self.selectRow(row)
         self.scrollToItem(self.currentItem())
 
+class NumberTableWidgetItem(ReadOnlyTableWidgetItem):
+    '''Sorts by number, shows the text given.'''
+    def __init__(self, text):
+        ReadOnlyTableWidgetItem.__init__(self, str(text if text is not None else ''))
+        try:
+            self.number = int(str(text).replace(',','').split('/')[0])
+        except ValueError:
+            self.number = -1
+
+    def __lt__(self, other):
+        return self.number < getattr(other,'number',-1)
+
+class StoryPickerDialog(SizePersistedDialog):
+    '''
+    Pick stories to download from a list of candidates, dicts with
+    url, title, author, fandoms, words, chapters, status, kudos and
+    reasons.
+    '''
+    def __init__(self, gui, header, message, candidates,
+                 icon=None, checked=False,
+                 save_size_name='fff:story picker dialog'):
+        SizePersistedDialog.__init__(self, gui, save_size_name)
+        self.setWindowTitle(header)
+        if icon:
+            self.setWindowIcon(icon)
+
+        self.l = QVBoxLayout()
+        self.setLayout(self.l)
+        label = QLabel(message)
+        label.setWordWrap(True)
+        self.l.addWidget(label)
+
+        self.table = QTableWidget(self)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        header_labels = [_('Title'), _('Author'), _('Fandom'), _('Words'),
+                         _('Chapters'), _('Status'), _('Kudos'), _('Why'), 'URL']
+        self.table.setColumnCount(len(header_labels))
+        self.table.setHorizontalHeaderLabels(header_labels)
+        self.table.setRowCount(len(candidates))
+        for row, cand in enumerate(candidates):
+            title = QTableWidgetItem(cand.get('title') or cand['url'])
+            title.setFlags(Qt.ItemIsUserCheckable|Qt.ItemIsSelectable|Qt.ItemIsEnabled)
+            title.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            title.setData(Qt.UserRole, cand['url'])
+            if cand.get('summary'):
+                title.setToolTip(cand['summary'])
+            self.table.setItem(row, 0, title)
+            self.table.setItem(row, 1, ReadOnlyTableWidgetItem(cand.get('author')))
+            self.table.setItem(row, 2, ReadOnlyTableWidgetItem(cand.get('fandoms')))
+            self.table.setItem(row, 3, NumberTableWidgetItem(cand.get('words')))
+            self.table.setItem(row, 4, NumberTableWidgetItem(cand.get('chapters')))
+            self.table.setItem(row, 5, ReadOnlyTableWidgetItem(cand.get('status')))
+            self.table.setItem(row, 6, NumberTableWidgetItem(cand.get('kudos')))
+            why = ReadOnlyTableWidgetItem('; '.join(cand.get('reasons',[])))
+            why.setToolTip('\n'.join(cand.get('reasons',[])))
+            self.table.setItem(row, 7, why)
+            self.table.setItem(row, 8, ReadOnlyTableWidgetItem(cand['url']))
+        ## enable after populating to keep the order given.
+        self.table.setSortingEnabled(True)
+        self.table.resizeColumnsToContents()
+        for col, width in ((0,300),(7,300)):
+            if self.table.columnWidth(col) > width:
+                self.table.setColumnWidth(col, width)
+        self.table.setMinimumSize(600, 0)
+        self.l.addWidget(self.table)
+
+        horz = QHBoxLayout()
+        all_button = QPushButton(_('Select All'), self)
+        all_button.clicked.connect(partial(self.set_all, Qt.Checked))
+        horz.addWidget(all_button)
+        none_button = QPushButton(_('Select None'), self)
+        none_button.clicked.connect(partial(self.set_all, Qt.Unchecked))
+        horz.addWidget(none_button)
+        horz.addStretch(1)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.button(QDialogButtonBox.Ok).setText(_('Download Selected'))
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        horz.addWidget(button_box)
+        self.l.addLayout(horz)
+
+        self.resize_dialog()
+
+    def set_all(self, state, checked=False):
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(state)
+
+    def get_urls(self):
+        return [ self.table.item(row, 0).data(Qt.UserRole)
+                 for row in range(self.table.rowCount())
+                 if self.table.item(row, 0).checkState() == Qt.Checked ]
+
 class RejectListDialog(SizePersistedDialog):
     def __init__(self, gui, reject_list,
                  rejectreasons=[],

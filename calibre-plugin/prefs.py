@@ -180,6 +180,7 @@ default_prefs['backup_before_update'] = True
 default_prefs['warn_chapter_loss'] = True
 default_prefs['detect_gone'] = True
 default_prefs['gone_threshold'] = 3
+default_prefs['discover_max_results'] = 50
 
 default_prefs['errorcol'] = ''
 default_prefs['save_all_errors'] = True
@@ -305,3 +306,7 @@ rejects_data = PrefsFacade(setting="rejects_data",
 ## book id (str), for marking books with the GONE_TAG.
 gone_data = PrefsFacade(setting="gone_data",
                         def_prefs={'gone_counts':{}})
+
+## Authors to check for new stories, [{'url':,'name':,'site':}].
+followed_data = PrefsFacade(setting="followed_data",
+                            def_prefs={'authors':[]})
